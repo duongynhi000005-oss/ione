@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{repos::PeerRepo, state::AppState};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Disconnected,
@@ -102,6 +102,22 @@ pub async fn start_sessions_for_active_peers(state: &AppState) {
     }
 }
 
+pub fn next_backoff(current: Duration, reached_live: bool) -> Duration {
+    if reached_live {
+        Duration::from_secs(1)
+    } else {
+        (current * 2).min(Duration::from_secs(300))
+    }
+}
+
+pub fn jitter_delay(backoff: Duration) -> Duration {
+    use rand::RngExt;
+    let min_micros = (backoff.as_micros() / 2).max(1);
+    let max_micros = backoff.as_micros().max(min_micros);
+    let micros = rand::rng().random_range(min_micros..=max_micros);
+    Duration::from_micros(micros as u64)
+}
+
 async fn run_session_task(state: AppState, peer_id: Uuid, state_tx: watch::Sender<SessionState>) {
     let idle_secs = std::env::var("IONE_PEER_SSE_IDLE_SECS")
         .ok()
@@ -115,16 +131,20 @@ async fn run_session_task(state: AppState, peer_id: Uuid, state_tx: watch::Sende
             .await;
         match connect_and_read(&state, peer_id, Duration::from_secs(idle_secs), &state_tx).await {
             Ok(()) => {
-                backoff = Duration::from_secs(1);
+                backoff = next_backoff(backoff, true);
             }
             Err(e) => {
+                let reached_live = *state_tx.borrow() == SessionState::Live;
+                if reached_live {
+                    backoff = Duration::from_secs(1);
+                }
                 let message = e.to_string();
                 let _ = state_tx.send(SessionState::Error(message.clone()));
                 let _ = PeerRepo::new(state.pool.clone())
                     .set_session_status(peer_id, "error", Some(&message))
                     .await;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300));
+                tokio::time::sleep(jitter_delay(backoff)).await;
+                backoff = next_backoff(backoff, false);
             }
         }
     }
@@ -235,4 +255,34 @@ async fn handle_sse_line(state: &AppState, peer_id: Uuid, line: &str) -> anyhow:
         crate::services::federation::dispatch_notification(state, peer_id, value).await?;
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_next_backoff_transitions() {
+        assert_eq!(next_backoff(Duration::from_secs(64), true), Duration::from_secs(1));
+        assert_eq!(next_backoff(Duration::from_secs(4), false), Duration::from_secs(8));
+        assert_eq!(next_backoff(Duration::from_secs(200), false), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_jitter_delay_range() {
+        let backoff = Duration::from_secs(10);
+        let min_expected = Duration::from_secs(5);
+        let max_expected = Duration::from_secs(10);
+        for _ in 0..1000 {
+            let delay = jitter_delay(backoff);
+            assert!(
+                delay >= min_expected && delay <= max_expected,
+                "Delay {:?} outside of [{:?}, {:?}]",
+                delay,
+                min_expected,
+                max_expected
+            );
+        }
+    }
 }
